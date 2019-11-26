@@ -21,39 +21,38 @@ import java.io.{File, PrintStream}
 import java.lang.{Iterable => JIterable}
 import java.util.{Locale, Map => JMap}
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
-
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hive.common.StatsSetupConst
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
+import org.apache.hadoop.hive.metastore.api.{FieldSchema, Order, SerDeInfo, StorageDescriptor, Database => HiveDatabase}
 import org.apache.hadoop.hive.metastore.{TableType => HiveTableType}
-import org.apache.hadoop.hive.metastore.api.{Database => HiveDatabase, FieldSchema, Order}
-import org.apache.hadoop.hive.metastore.api.{SerDeInfo, StorageDescriptor}
 import org.apache.hadoop.hive.ql.Driver
 import org.apache.hadoop.hive.ql.metadata.{Hive, Partition => HivePartition, Table => HiveTable}
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_ASC
 import org.apache.hadoop.hive.ql.processors._
 import org.apache.hadoop.hive.ql.session.SessionState
-
-import org.apache.spark.{SparkConf, SparkException}
 import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchPartitionException}
-import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
+import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParseException}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.hive.HiveExternalCatalog.{DATASOURCE_SCHEMA, DATASOURCE_SCHEMA_NUMPARTS, DATASOURCE_SCHEMA_PART_PREFIX}
 import org.apache.spark.sql.hive.client.HiveClientImpl._
+import org.apache.spark.sql.hive.prestoviews.PrestoViewDecodeParser
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{CircularBuffer, Utils}
+import org.apache.spark.{SparkConf, SparkException}
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * A class that wraps the HiveClient and converts its responses to externally visible classes.
@@ -426,7 +425,13 @@ private[hive] class HiveClientImpl(
         case (key, _) => excludedTableProperties.contains(key)
       }
       val comment = properties.get("comment")
-
+      val (text, finalSchema) = if ( Option(h.getViewExpandedText).isDefined
+        && PrestoViewDecodeParser.isViewMarker(h.getViewExpandedText)) {
+        val (sql, prestoViewSchema) = PrestoViewDecodeParser.decode(h.getViewOriginalText)
+        (Option(sql), prestoViewSchema)
+      } else {
+        (Option(h.getViewExpandedText), schema)
+      }
       CatalogTable(
         identifier = TableIdentifier(h.getTableName, Option(h.getDbName)),
         tableType = h.getTableType match {
@@ -437,7 +442,7 @@ private[hive] class HiveClientImpl(
             val tableTypeStr = unsupportedType.toString.toLowerCase(Locale.ROOT).replace("_", " ")
             throw new AnalysisException(s"Hive $tableTypeStr is not supported.")
         },
-        schema = schema,
+        schema = finalSchema,
         partitionColumnNames = partCols.map(_.name),
         // If the table is written by Spark, we will put bucketing information in table properties,
         // and will always overwrite the bucket spec in hive metastore by the bucketing information
@@ -471,7 +476,7 @@ private[hive] class HiveClientImpl(
         // In older versions of Spark(before 2.2.0), we expand the view original text and store
         // that into `viewExpandedText`, and that should be used in view resolution. So we get
         // `viewExpandedText` instead of `viewOriginalText` for viewText here.
-        viewText = Option(h.getViewExpandedText),
+        viewText = text,
         unsupportedFeatures = unsupportedFeatures,
         ignoredProperties = ignoredProperties.toMap)
     }
