@@ -20,25 +20,22 @@ package org.apache.spark
 import java.io.File
 import java.net.Socket
 import java.util.Locale
-
 import scala.collection.JavaConverters._
 import scala.collection.concurrent
 import scala.collection.mutable
 import scala.util.Properties
-
 import com.google.common.cache.CacheBuilder
 import org.apache.hadoop.conf.Configuration
-
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.api.python.PythonWorkerFactory
 import org.apache.spark.broadcast.BroadcastManager
 import org.apache.spark.executor.ExecutorBackend
-import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.{Logging, config}
 import org.apache.spark.internal.config._
 import org.apache.spark.memory.{MemoryManager, UnifiedMemoryManager}
 import org.apache.spark.metrics.{MetricsSystem, MetricsSystemInstances}
 import org.apache.spark.network.netty.{NettyBlockTransferService, SparkTransportConf}
-import org.apache.spark.network.shuffle.ExternalBlockStoreClient
+import org.apache.spark.network.shuffle.{ExternalBlockStoreClient, NFSBlockStoreClient}
 import org.apache.spark.rpc.{RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.{LiveListenerBus, OutputCommitCoordinator}
 import org.apache.spark.scheduler.OutputCommitCoordinator.OutputCommitCoordinatorEndpoint
@@ -327,8 +324,17 @@ object SparkEnv extends Logging {
 
     val externalShuffleClient = if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
       val transConf = SparkTransportConf.fromSparkConf(conf, "shuffle", numUsableCores)
-      Some(new ExternalBlockStoreClient(transConf, securityManager,
-        securityManager.isAuthenticationEnabled(), conf.get(config.SHUFFLE_REGISTRATION_TIMEOUT)))
+      if (conf.get(config.SHUFFLE_SERVICE_NFS_ENABLED)) {
+        logInfo("Using NFSBlockStoreClient")
+        // TODO: how to read it clean ??
+        val localDir = conf.get("spark.local.dir").split(",")(0)
+        Some(new NFSBlockStoreClient(localDir, transConf, securityManager,
+          securityManager.isAuthenticationEnabled(), conf.get(config.SHUFFLE_REGISTRATION_TIMEOUT),
+          numUsableCores))
+      } else {
+        Some(new ExternalBlockStoreClient(transConf, securityManager,
+          securityManager.isAuthenticationEnabled(), conf.get(config.SHUFFLE_REGISTRATION_TIMEOUT)))
+      }
     } else {
       None
     }

@@ -17,25 +17,22 @@
 
 package org.apache.spark.storage
 
-import java.io.{InputStream, IOException}
+import java.io.{IOException, InputStream}
 import java.nio.channels.ClosedByInterruptException
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.CheckedInputStream
 import javax.annotation.concurrent.GuardedBy
-
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet, Queue}
-import scala.util.{Failure, Success}
-
+import scala.util.{Failure, Success, Try}
 import io.netty.util.internal.OutOfDirectMemoryError
 import org.apache.commons.io.IOUtils
 import org.roaringbitmap.RoaringBitmap
-
 import org.apache.spark.{MapOutputTracker, TaskContext}
 import org.apache.spark.MapOutputTracker.SHUFFLE_PUSH_MAP_ID
 import org.apache.spark.errors.SparkCoreErrors
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, config}
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
 import org.apache.spark.network.shuffle._
 import org.apache.spark.network.shuffle.checksum.{Cause, ShuffleChecksumHelper}
@@ -125,6 +122,9 @@ final class ShuffleBlockFetcherIterator(
   /** Host local blocks to fetch, excluding zero-sized blocks. */
   private[this] val hostLocalBlocks = scala.collection.mutable.LinkedHashSet[(BlockId, Int)]()
 
+  /** NFS Blocks that are queued to avoid FS IO Throttling. */
+  private [this] val deferredNFSBlocks = new Queue[DeferredNFSBlockFetch]()
+
   /**
    * A queue to hold our results. This turns the asynchronous model provided by
    * [[org.apache.spark.network.BlockTransferService]] into a synchronous model (iterator).
@@ -188,6 +188,13 @@ final class ShuffleBlockFetcherIterator(
 
   private[this] val pushBasedFetchHelper = new PushBasedFetchHelper(
     this, shuffleClient, blockManager, mapOutputTracker)
+
+  private[this] val nfsShuffleClientEnabled =
+    blockManager.conf.get(config.SHUFFLE_SERVICE_NFS_ENABLED)
+
+  private[this] var availableNFSBlockSizeForFetch: Long = maxBytesInFlight
+
+  private[this] var availableNFSBlockFetchSlots: Long = maxBlocksInFlightPerAddress
 
   initialize()
 
@@ -406,7 +413,7 @@ final class ShuffleBlockFetcherIterator(
         localBlocks ++= mergedBlockInfos.map(info => (info.blockId, info.mapIndex))
         localBlockBytes += mergedBlockInfos.map(_.size).sum
       } else if (blockManager.hostLocalDirManager.isDefined &&
-        address.host == blockManager.blockManagerId.host) {
+        (address.host == blockManager.blockManagerId.host||nfsShuffleClientEnabled)) {
         val mergedBlockInfos = mergeContinuousShuffleBlockIdsIfNeeded(
           blockInfos.map(info => FetchBlockInfo(info._1, info._2, info._3)), doBatchFetch)
         numBlocksToFetch += mergedBlockInfos.size
@@ -602,6 +609,20 @@ final class ShuffleBlockFetcherIterator(
     }
   }
 
+  private[this] def getHostLocalBuffer(
+                                         blockId: BlockId,
+                                         mapIndex: Int,
+                                         localDirs: Array[String],
+                                         blockManagerId: BlockManagerId): Try[ManagedBuffer] = {
+    try {
+      val buf = blockManager.getHostLocalShuffleData(blockId, localDirs)
+      buf.retain()
+      Success(buf)
+    } catch {
+      case e: Exception => Failure(e)
+    }
+  }
+
   /**
    * Fetch the host-local blocks while we are fetching remote blocks. This is ok because
    * `ManagedBuffer`'s memory is allocated lazily when we create the input stream, so all we
@@ -669,14 +690,58 @@ final class ShuffleBlockFetcherIterator(
     // a `FailureFetchResult` immediately to the `results`. So there's no reason to fetch the
     // remaining blocks.
     val allFetchSucceeded = bmIdToBlocks.forall { case (bmId, blockInfos) =>
-      blockInfos.forall { case (blockId, _, mapIndex) =>
-        fetchHostLocalBlock(blockId, mapIndex, localDirsByExecId(bmId.executorId), bmId)
+      blockInfos.forall { case (blockId, size, mapIndex) =>
+        if (nfsShuffleClientEnabled) {
+          getHostLocalBuffer(blockId, mapIndex, localDirsByExecId(bmId.executorId), bmId)
+          match {
+            case Success(dataBuffer) =>
+              if (availableNFSBlockSizeForFetch > dataBuffer.size()
+                && availableNFSBlockFetchSlots > 0) {
+                availableNFSBlockSizeForFetch -= dataBuffer.size()
+                availableNFSBlockFetchSlots -= 1
+                fetchHostLocalBlock(blockId, mapIndex, localDirsByExecId(bmId.executorId), bmId)
+                results.put(SuccessFetchResult(blockId, mapIndex, bmId, dataBuffer.size(),
+                  dataBuffer, isNetworkReqDone = false))
+                true
+              } else {
+                deferredNFSBlocks.enqueue(DeferredNFSBlockFetch(blockId, mapIndex,
+                  dataBuffer.size(), dataBuffer, bmId))
+                true
+              }
+            case Failure(throwable) =>
+              logError(s"Error occurred while fetching local blocks", throwable)
+              results.put(FailureFetchResult(blockId, mapIndex, bmId, throwable))
+              false
+          }
+        } else {
+          fetchHostLocalBlock(blockId, mapIndex, localDirsByExecId(bmId.executorId), bmId)
+        }
       }
     }
     if (allFetchSucceeded) {
       logDebug(s"Got host-local blocks from ${bmIdToBlocks.keys.mkString(", ")} " +
         s"(${if (cached) "with" else "without"} cached executors' dir) " +
         s"in ${Utils.getUsedTimeNs(startTimeNs)}")
+    }
+  }
+
+  private def fetchDeferredNFSBlock(result: SuccessFetchResult): Unit = {
+    availableNFSBlockSizeForFetch += result.size
+    availableNFSBlockFetchSlots += 1
+    deferredNFSBlocks.dequeueFirst(b => b.size <= availableNFSBlockSizeForFetch) match {
+      case Some(deferredNFSBlock) =>
+        availableNFSBlockSizeForFetch -= deferredNFSBlock.size
+        availableNFSBlockFetchSlots -= 1
+        results.put(SuccessFetchResult(
+          deferredNFSBlock.blockId,
+          deferredNFSBlock.mapIndex,
+          deferredNFSBlock.blockManagerId,
+          deferredNFSBlock.size,
+          deferredNFSBlock.buffer,
+          isNetworkReqDone = false))
+      case None =>
+        logInfo(s"NFSBlockFetch: ${availableNFSBlockSizeForFetch} bytes space available " +
+        s"but no fitting blocks found out of pending ${deferredNFSBlocks.size} blocks")
     }
   }
 
@@ -757,11 +822,15 @@ final class ShuffleBlockFetcherIterator(
       result match {
         case r @ SuccessFetchResult(blockId, mapIndex, address, size, buf, isNetworkReqDone) =>
           if (address != blockManager.blockManagerId) {
-            if (hostLocalBlocks.contains(blockId -> mapIndex) ||
+            val isHostLocal = hostLocalBlocks.contains(blockId -> mapIndex)
+            if (isHostLocal ||
               pushBasedFetchHelper.isLocalPushMergedBlockAddress(address)) {
               // It is a host local block or a local shuffle chunk
               shuffleMetrics.incLocalBlocksFetched(1)
               shuffleMetrics.incLocalBytesRead(buf.size)
+              if (isHostLocal && nfsShuffleClientEnabled) {
+                fetchDeferredNFSBlock(r)
+              }
             } else {
               numBlocksInFlightPerAddress(address) = numBlocksInFlightPerAddress(address) - 1
               shuffleMetrics.incRemoteBytesRead(buf.size)
@@ -1464,6 +1533,17 @@ object ShuffleBlockFetcherIterator {
       forMergedMetas: Boolean = false) {
     val size = blocks.map(_.size).sum
   }
+
+  /**
+   * NFS Block read that should be deferred for some reasons, e.g., NFS throttling
+   */
+  private[storage]
+  case class DeferredNFSBlockFetch(
+                                    blockId: BlockId,
+                                    mapIndex: Int,
+                                    size: Long,
+                                    buffer: ManagedBuffer,
+                                    blockManagerId: BlockManagerId)
 
   /**
    * Result of a fetch from a remote block.

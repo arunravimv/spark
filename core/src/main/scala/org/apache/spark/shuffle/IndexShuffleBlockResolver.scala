@@ -597,6 +597,13 @@ private[spark] class IndexShuffleBlockResolver(
         getDataFile(shuffleId, mapId, dirs),
         startOffset,
         endOffset - startOffset)
+    } catch {
+      case eofe: EOFException => throw new EOFException(s"Block Index/Data file for block " +
+        s"${blockId.getClass.getSimpleName}($shuffleId, $mapId, $startReduceId, $endReduceId," +
+        s" [${dirs.map(d => d.mkString(", ")).getOrElse("use the disk manager's local")}])" +
+        s" Index: ${indexFile.getAbsolutePath}" +
+        s" Data: ${getDataFile(shuffleId, mapId, dirs).getAbsolutePath} " +
+        s"raised ${eofe.getStackTrace.mkString("\n")}")
     } finally {
       in.close()
     }

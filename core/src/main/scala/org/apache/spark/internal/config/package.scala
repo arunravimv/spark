@@ -727,6 +727,26 @@ package object config {
       .stringConf
       .createWithDefault("spark_shuffle")
 
+  private[spark] val SHUFFLE_SERVICE_NFS_ENABLED =
+    ConfigBuilder("spark.shuffle.service.nfs.enabled")
+      .doc(s"This can be configured to true if we use Shared Network Filesystem for spark.local.dir" +
+        s" When true along with $SHUFFLE_SERVICE_ENABLED, all spark shuffle and" +
+        s" rdd blocks are read as host local read " +
+        s"$SHUFFLE_SERVICE_ENABLED is set to true.")
+      .version("3.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val NFS_SHUFFLE_SERVICE_MANAGER_HOST =
+    ConfigBuilder("spark.shuffle.service.nfs.manager")
+      .doc(s"External shuffle service host name for NFS based shuffle service" +
+        s" When used along with $SHUFFLE_SERVICE_ENABLED, all spark shuffle and" +
+        s" rdd blocks are read as host local read " +
+        s"$SHUFFLE_SERVICE_NFS_ENABLED is set to true.")
+      .version("3.3.0")
+      .stringConf
+      .createWithDefault("localhost")
+
   private[spark] val KEYTAB = ConfigBuilder("spark.kerberos.keytab")
     .doc("Location of user's keytab.")
     .version("3.0.0")
