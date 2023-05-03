@@ -26,6 +26,7 @@ import javax.annotation.concurrent.GuardedBy
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet, Queue}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.Breaks.{break, breakable}
 import io.netty.util.internal.OutOfDirectMemoryError
 import org.apache.commons.io.IOUtils
 import org.roaringbitmap.RoaringBitmap
@@ -191,6 +192,9 @@ final class ShuffleBlockFetcherIterator(
 
   private[this] val nfsShuffleClientEnabled =
     blockManager.conf.get(config.SHUFFLE_SERVICE_NFS_ENABLED)
+
+  private[this] val maxDelaySeconds =
+    blockManager.conf.get(config.SHUFFLE_SERVICE_NFS_FETCH_DELAY)
 
   private[this] var availableNFSBlockSizeForFetch: Long = maxBytesInFlight
 
@@ -718,6 +722,10 @@ final class ShuffleBlockFetcherIterator(
         }
       }
     }
+    if(nfsShuffleClientEnabled && deferredNFSBlocks.nonEmpty) {
+      results.put(DelayNFSBlockFetch(System.currentTimeMillis(), maxDelaySeconds))
+    }
+    delayThread(context, System.currentTimeMillis(), maxDelaySeconds)
     if (allFetchSucceeded) {
       logDebug(s"Got host-local blocks from ${bmIdToBlocks.keys.mkString(", ")} " +
         s"(${if (cached) "with" else "without"} cached executors' dir) " +
@@ -725,23 +733,29 @@ final class ShuffleBlockFetcherIterator(
     }
   }
 
-  private def fetchDeferredNFSBlock(result: SuccessFetchResult): Unit = {
-    availableNFSBlockSizeForFetch += result.size
-    availableNFSBlockFetchSlots += 1
-    deferredNFSBlocks.dequeueFirst(b => b.size <= availableNFSBlockSizeForFetch) match {
-      case Some(deferredNFSBlock) =>
-        availableNFSBlockSizeForFetch -= deferredNFSBlock.size
-        availableNFSBlockFetchSlots -= 1
-        results.put(SuccessFetchResult(
-          deferredNFSBlock.blockId,
-          deferredNFSBlock.mapIndex,
-          deferredNFSBlock.blockManagerId,
-          deferredNFSBlock.size,
-          deferredNFSBlock.buffer,
-          isNetworkReqDone = false))
-      case None =>
-        logInfo(s"NFSBlockFetch: ${availableNFSBlockSizeForFetch} bytes space available " +
-        s"but no fitting blocks found out of pending ${deferredNFSBlocks.size} blocks")
+  private def fetchDeferredNFSBlock(): Unit = {
+    breakable {
+      while (true) {
+        deferredNFSBlocks.dequeueFirst(b => b.size <= availableNFSBlockSizeForFetch) match {
+          case Some(deferredNFSBlock) =>
+            availableNFSBlockSizeForFetch -= deferredNFSBlock.size
+            availableNFSBlockFetchSlots -= 1
+            results.put(SuccessFetchResult(
+              deferredNFSBlock.blockId,
+              deferredNFSBlock.mapIndex,
+              deferredNFSBlock.blockManagerId,
+              deferredNFSBlock.size,
+              deferredNFSBlock.buffer,
+              isNetworkReqDone = false))
+          case None =>
+            logInfo(s"NFSBlockFetch: ${availableNFSBlockSizeForFetch} bytes space available " +
+              s"but no fitting blocks found out of pending ${deferredNFSBlocks.size} blocks")
+            break;
+        }
+      }
+    }
+    if(nfsShuffleClientEnabled && deferredNFSBlocks.nonEmpty) {
+      results.put(DelayNFSBlockFetch(System.currentTimeMillis(), maxDelaySeconds))
     }
   }
 
@@ -829,7 +843,8 @@ final class ShuffleBlockFetcherIterator(
               shuffleMetrics.incLocalBlocksFetched(1)
               shuffleMetrics.incLocalBytesRead(buf.size)
               if (isHostLocal && nfsShuffleClientEnabled) {
-                fetchDeferredNFSBlock(r)
+                availableNFSBlockSizeForFetch += size
+                availableNFSBlockFetchSlots += 1
               }
             } else {
               numBlocksInFlightPerAddress(address) = numBlocksInFlightPerAddress(address) - 1
@@ -1063,6 +1078,11 @@ final class ShuffleBlockFetcherIterator(
           pushBasedFetchHelper.initiateFallbackFetchForPushMergedBlock(
             ShuffleMergedBlockId(shuffleId, shuffleMergeId, reduceId), address)
           // Set result to null to force another iteration.
+          result = null
+
+        case DelayNFSBlockFetch(startTime, maxDelaySeconds) =>
+          delayThread(context, startTime, maxDelaySeconds)
+          fetchDeferredNFSBlock()
           result = null
       }
 
@@ -1412,7 +1432,9 @@ private class ShuffleFetchCompletionListener(var data: ShuffleBlockFetcherIterat
 }
 
 private[storage]
-object ShuffleBlockFetcherIterator {
+object ShuffleBlockFetcherIterator extends Logging {
+
+  val rnd = new scala.util.Random
 
   /**
    * A flag which indicates whether the Netty OOM error has raised during shuffle.
@@ -1426,6 +1448,18 @@ object ShuffleBlockFetcherIterator {
     if (isNettyOOMOnShuffle.get() && NettyUtils.freeDirectMemory() >= freeMemoryLowerBound) {
       isNettyOOMOnShuffle.compareAndSet(true, false)
     }
+  }
+
+  def delayThread(tc: TaskContext, startTime: Long, maxDelaySeconds: Int): Unit = {
+      val delayMillis = rnd.synchronized { rnd.nextInt(maxDelaySeconds*1000)*1L}
+      val remainingMillis = startTime + delayMillis - System.currentTimeMillis()
+      if (remainingMillis > 0) {
+        logInfo(s"Sleeping Task (stage: ${tc.stageId()}," +
+          s" partition: ${tc.partitionId()}," +
+          s" id: ${tc.taskAttemptId()}, attempt: ${tc.attemptNumber()})" +
+          s" for $remainingMillis milliseconds")
+        Thread.sleep(remainingMillis)
+      }
   }
 
   /**
@@ -1659,4 +1693,8 @@ object ShuffleBlockFetcherIterator {
       reduceId: Int,
       bitmaps: Array[RoaringBitmap],
       localDirs: Array[String]) extends FetchResult
+
+  private[storage] case class DelayNFSBlockFetch(
+      startTime: Long,
+      maxDelaySeconds: Int) extends FetchResult
 }

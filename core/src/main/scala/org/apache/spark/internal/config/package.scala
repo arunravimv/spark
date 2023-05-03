@@ -737,6 +737,13 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val SHUFFLE_SERVICE_NFS_FETCH_DELAY =
+    ConfigBuilder("spark.shuffle.service.nfs.fetch.delay")
+      .doc(s"This can be configured to add delay is NFS fetch to get around throttling")
+      .version("3.3.0")
+      .intConf
+      .createWithDefault(10)
+
   private[spark] val NFS_SHUFFLE_SERVICE_MANAGER_HOST =
     ConfigBuilder("spark.shuffle.service.nfs.manager")
       .doc(s"External shuffle service host name for NFS based shuffle service" +
